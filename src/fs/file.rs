@@ -3,8 +3,8 @@ use std::os::unix::prelude::*;
 use std::path::{Path, PathBuf};
 use std::{fmt, io};
 
-use intrusive_collections::linked_list::LinkedListOps;
 use intrusive_collections::DefaultLinkOps;
+use intrusive_collections::linked_list::LinkedListOps;
 use lock_api::RawMutex;
 
 use crate::errors::AioCommandError;

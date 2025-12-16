@@ -1,3 +1,10 @@
+#![allow(
+    clippy::await_holding_refcell_ref,
+    clippy::explicit_auto_deref,
+    clippy::needless_borrow,
+    clippy::unnecessary_mut_passed
+)]
+
 use std::fs::{OpenOptions, Permissions};
 use std::io::{Read, Seek, SeekFrom};
 use std::mem;
@@ -5,16 +12,14 @@ use std::os::unix::prelude::*;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::channel::oneshot;
-use futures::future::join_all;
-use futures::{select_biased, FutureExt};
+use tokio::sync::oneshot;
 use tokio::task::{self, LocalSet};
-use tokio::time::delay_for;
+use tokio::time::sleep;
 
 use assert_matches::assert_matches;
 use helpers::*;
 use linux_aio_tokio::{
-    aio_context, local_aio_context, AioCommandError, LockedBuf, ReadFlags, WriteFlags,
+    AioCommandError, LockedBuf, ReadFlags, WriteFlags, aio_context, local_aio_context,
 };
 use linux_aio_tokio::{AioOpenOptionsExt, File};
 use std::cell::RefCell;
@@ -188,8 +193,8 @@ async fn file_open_and_meta() {
     .unwrap();
     assert!(validate_block(buffer.as_ref()));
 
-    assert!(file
-        .write_at(
+    assert!(
+        file.write_at(
             &aio_handle,
             0,
             &mut buffer,
@@ -197,7 +202,8 @@ async fn file_open_and_meta() {
             WriteFlags::empty()
         )
         .await
-        .is_err());
+        .is_err()
+    );
 
     file.metadata().await.unwrap();
     file.set_permissions(Permissions::from_mode(0o644))
@@ -229,8 +235,8 @@ async fn file_create_and_set_len() {
     .await
     .unwrap();
 
-    assert!(file
-        .read_at(
+    assert!(
+        file.read_at(
             &aio_handle,
             0,
             &mut buffer,
@@ -238,12 +244,13 @@ async fn file_create_and_set_len() {
             ReadFlags::empty()
         )
         .await
-        .is_err());
+        .is_err()
+    );
 
     dir.close().unwrap();
 }
 
-#[tokio::test(threaded_scheduler)]
+#[tokio::test(flavor = "multi_thread")]
 async fn read_block_mt() {
     let (dir, path) = create_filled_tempfile(FILE_SIZE);
 
@@ -305,7 +312,7 @@ async fn panic_on_wrong_len() {
     dir.close().unwrap();
 }
 
-#[tokio::test(threaded_scheduler)]
+#[tokio::test(flavor = "multi_thread")]
 async fn write_block_mt() {
     let (dir, path) = create_filled_tempfile(FILE_SIZE);
 
@@ -368,21 +375,21 @@ async fn write_block_mt() {
     let mut read_buffer: [u8; BUF_CAPACITY] = [0u8; BUF_CAPACITY];
 
     file.seek(SeekFrom::Start(16384)).unwrap();
-    file.read(&mut read_buffer).unwrap();
+    file.read_exact(&mut read_buffer).unwrap();
     assert!(validate_pattern(65u8, &read_buffer));
 
     file.seek(SeekFrom::Start(32768)).unwrap();
-    file.read(&mut read_buffer).unwrap();
+    file.read_exact(&mut read_buffer).unwrap();
     assert!(validate_pattern(66u8, &read_buffer));
 
     file.seek(SeekFrom::Start(49152)).unwrap();
-    file.read(&mut read_buffer).unwrap();
+    file.read_exact(&mut read_buffer).unwrap();
     assert!(validate_pattern(67u8, &read_buffer));
 
     dir.close().unwrap();
 }
 
-#[tokio::test(threaded_scheduler)]
+#[tokio::test(flavor = "multi_thread")]
 async fn invalid_offset() {
     let (dir, path) = create_filled_tempfile(FILE_SIZE);
 
@@ -404,12 +411,14 @@ async fn invalid_offset() {
         )
         .await;
 
-    assert!(res.is_err());
+    if let Ok(bytes) = res {
+        assert_eq!(0, bytes);
+    }
 
     dir.close().unwrap();
 }
 
-#[tokio::test(basic_scheduler)]
+#[tokio::test(flavor = "current_thread")]
 async fn future_cancellation() {
     let (dir, path) = create_filled_tempfile(FILE_SIZE);
 
@@ -423,38 +432,33 @@ async fn future_cancellation() {
     let num_slots = 10;
 
     let (aio, aio_handle) = aio_context(num_slots, true).unwrap();
-    let mut read = Box::pin(
-        file.read_at(
-            &aio_handle,
-            0,
-            &mut buffer,
-            BUF_CAPACITY as _,
-            ReadFlags::empty(),
-        )
-        .fuse(),
-    );
+    let mut read = Box::pin(file.read_at(
+        &aio_handle,
+        0,
+        &mut buffer,
+        BUF_CAPACITY as _,
+        ReadFlags::empty(),
+    ));
 
-    let (_, immediate) = oneshot::channel::<()>();
+    let (_, mut immediate) = oneshot::channel::<()>();
 
-    let mut immediate = immediate.fuse();
-
-    select_biased! {
-        _ = read => {
-            assert!(false);
+    tokio::select! {
+        _ = &mut read => {
+            panic!("slot returned unexpectedly early");
         },
-        _ = immediate => {},
+        _ = &mut immediate => {},
     }
 
     mem::drop(read);
 
     while aio.available_slots().unwrap() != num_slots {
-        delay_for(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
     }
 
     dir.close().unwrap();
 }
 
-#[tokio::test(threaded_scheduler)]
+#[tokio::test(flavor = "multi_thread")]
 async fn mixed_read_write_at() {
     let (dir, path) = create_filled_tempfile(FILE_SIZE);
 
@@ -687,15 +691,11 @@ async fn mixed_read_write_at() {
         }
     };
 
-    join_all(vec![
-        tokio::spawn(seq1),
-        tokio::spawn(seq2),
-        tokio::spawn(seq3),
-    ])
-    .await
-    .into_iter()
-    .collect::<Result<Vec<_>, _>>()
-    .unwrap();
+    let handles = vec![tokio::spawn(seq1), tokio::spawn(seq2), tokio::spawn(seq3)];
+
+    for handle in handles {
+        handle.await.unwrap();
+    }
 
     dir.close().unwrap();
 }

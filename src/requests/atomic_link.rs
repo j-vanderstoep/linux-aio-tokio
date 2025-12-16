@@ -15,8 +15,11 @@ pub struct AtomicLink {
 
 unsafe impl Sync for AtomicLink {}
 
-const UNLINKED_MARKER: Option<NonNull<AtomicLink>> =
-    unsafe { Some(NonNull::new_unchecked(1 as *mut AtomicLink)) };
+const UNLINKED_MARKER: Option<NonNull<AtomicLink>> = unsafe {
+    Some(NonNull::new_unchecked(
+        std::ptr::dangling_mut::<AtomicLink>(),
+    ))
+};
 
 impl AtomicLink {
     /// Creates a new `Link`.

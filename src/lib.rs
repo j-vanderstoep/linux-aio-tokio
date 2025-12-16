@@ -1,5 +1,6 @@
 #![deny(missing_debug_implementations)]
 #![deny(missing_docs)]
+#![allow(unsafe_op_in_unsafe_fn, async_fn_in_trait)]
 
 //! Tokio Bindings for Linux Kernel AIO
 //!
@@ -18,12 +19,10 @@ use std::ptr;
 use std::sync::{Arc, Weak};
 use std::{fmt, io, mem};
 
-use futures::channel::oneshot;
-use futures::{pin_mut, select, FutureExt, StreamExt};
-use futures_intrusive::sync::GenericSemaphore;
 use intrusive_collections::linked_list::LinkedListOps;
-use intrusive_collections::{linked_list, DefaultLinkOps};
+use intrusive_collections::{DefaultLinkOps, linked_list};
 use lock_api::{Mutex, RawMutex};
+use tokio::sync::{Semaphore, oneshot};
 use tokio::task;
 
 pub use commands::*;
@@ -63,16 +62,13 @@ pub(crate) struct GenericAioContextInner<
     context: aio::aio_context_t,
     eventfd: RawFd,
     num_slots: usize,
-    capacity: Option<GenericSemaphore<M>>,
+    capacity: Option<Arc<Semaphore>>,
     requests: Mutex<M, Requests<M, A, L>>,
     stop_tx: Mutex<M, Option<oneshot::Sender<()>>>,
 }
 
-impl<
-        M: RawMutex,
-        A: crate::IntrusiveAdapter<M, L>,
-        L: DefaultLinkOps<Ops = A::LinkOps> + Default,
-    > GenericAioContextInner<M, A, L>
+impl<M: RawMutex, A: crate::IntrusiveAdapter<M, L>, L: DefaultLinkOps<Ops = A::LinkOps> + Default>
+    GenericAioContextInner<M, A, L>
 where
     A::LinkOps: LinkedListOps + Default,
 {
@@ -94,7 +90,7 @@ where
             context,
             requests: Mutex::new(Requests::new(nr)?),
             capacity: if use_semaphore {
-                Some(GenericSemaphore::new(true, nr))
+                Some(Arc::new(Semaphore::new(nr)))
             } else {
                 None
             },
@@ -105,11 +101,8 @@ where
     }
 }
 
-impl<
-        M: RawMutex,
-        A: crate::IntrusiveAdapter<M, L>,
-        L: DefaultLinkOps<Ops = A::LinkOps> + Default,
-    > Drop for GenericAioContextInner<M, A, L>
+impl<M: RawMutex, A: crate::IntrusiveAdapter<M, L>, L: DefaultLinkOps<Ops = A::LinkOps> + Default>
+    Drop for GenericAioContextInner<M, A, L>
 where
     A::LinkOps: LinkedListOps + Default,
 {
@@ -137,11 +130,8 @@ pub struct GenericAioContext<
     inner: Arc<GenericAioContextInner<M, A, L>>,
 }
 
-impl<
-        M: RawMutex,
-        A: crate::IntrusiveAdapter<M, L>,
-        L: DefaultLinkOps<Ops = A::LinkOps> + Default,
-    > fmt::Debug for GenericAioContext<M, A, L>
+impl<M: RawMutex, A: crate::IntrusiveAdapter<M, L>, L: DefaultLinkOps<Ops = A::LinkOps> + Default>
+    fmt::Debug for GenericAioContext<M, A, L>
 where
     A::LinkOps: LinkedListOps + Default,
 {
@@ -163,11 +153,8 @@ pub struct GenericAioContextHandle<
     inner: Weak<GenericAioContextInner<M, A, L>>,
 }
 
-impl<
-        M: RawMutex,
-        A: crate::IntrusiveAdapter<M, L>,
-        L: DefaultLinkOps<Ops = A::LinkOps> + Default,
-    > Clone for GenericAioContextHandle<M, A, L>
+impl<M: RawMutex, A: crate::IntrusiveAdapter<M, L>, L: DefaultLinkOps<Ops = A::LinkOps> + Default>
+    Clone for GenericAioContextHandle<M, A, L>
 where
     A::LinkOps: LinkedListOps + Default,
 {
@@ -178,11 +165,8 @@ where
     }
 }
 
-impl<
-        M: RawMutex,
-        A: crate::IntrusiveAdapter<M, L>,
-        L: DefaultLinkOps<Ops = A::LinkOps> + Default,
-    > GenericAioContextHandle<M, A, L>
+impl<M: RawMutex, A: crate::IntrusiveAdapter<M, L>, L: DefaultLinkOps<Ops = A::LinkOps> + Default>
+    GenericAioContextHandle<M, A, L>
 where
     A::LinkOps: LinkedListOps + Default,
 {
@@ -193,7 +177,7 @@ where
     pub fn available_slots(&self) -> Option<usize> {
         self.inner
             .upgrade()
-            .and_then(|i| i.capacity.as_ref().map(|c| c.permits()))
+            .and_then(|i| i.capacity.as_ref().map(|c| c.available_permits()))
     }
 
     /// Submit command to the AIO context
@@ -209,11 +193,11 @@ where
         let inner_context = self
             .inner
             .upgrade()
-            .ok_or_else(|| AioCommandError::AioStopped)?
+            .ok_or(AioCommandError::AioStopped)?
             .clone();
 
         if let Some(cap) = &inner_context.capacity {
-            cap.acquire(1).await.disarm();
+            cap.acquire().await.expect("semaphore closed").forget();
         }
 
         let mut request = inner_context
@@ -238,13 +222,7 @@ where
                 tx,
             );
 
-            unsafe {
-                aio::io_submit(
-                    inner_context.context,
-                    1,
-                    request_ptr_array.as_mut_ptr() as *mut *mut aio::iocb,
-                )
-            }
+            unsafe { aio::io_submit(inner_context.context, 1, request_ptr_array.as_mut_ptr()) }
         };
 
         if result != 1 {
@@ -254,7 +232,7 @@ where
                 .lock()
                 .return_in_flight_to_ready(request);
             if let Some(c) = &inner_context.capacity {
-                c.release(1)
+                c.add_permits(1)
             }
 
             return Err(AioCommandError::IoSubmit(io::Error::last_os_error()));
@@ -274,11 +252,8 @@ where
     }
 }
 
-impl<
-        M: RawMutex,
-        A: crate::IntrusiveAdapter<M, L>,
-        L: DefaultLinkOps<Ops = A::LinkOps> + Default,
-    > fmt::Debug for GenericAioContextHandle<M, A, L>
+impl<M: RawMutex, A: crate::IntrusiveAdapter<M, L>, L: DefaultLinkOps<Ops = A::LinkOps> + Default>
+    fmt::Debug for GenericAioContextHandle<M, A, L>
 where
     A::LinkOps: LinkedListOps + Default,
 {
@@ -330,7 +305,7 @@ where
         async move {
             let mut events = Vec::with_capacity(nr);
 
-            while let Some(Ok(available)) = eventfd.next().await {
+            while let Ok(available) = eventfd.recv().await {
                 assert!(available > 0, "kernel reported zero ready events");
                 assert!(
                     available <= nr as u64,
@@ -375,7 +350,7 @@ where
                             .return_outstanding_to_ready(request_ptr);
 
                         if let Some(c) = &inner.capacity {
-                            c.release(1)
+                            c.add_permits(1)
                         }
                     }
                 }
@@ -383,15 +358,15 @@ where
 
             Ok(())
         }
-    }
-    .fuse();
+    };
 
     let background = async move {
-        pin_mut!(poll_future);
+        tokio::pin!(poll_future);
+        tokio::pin!(stop_rx);
 
-        select! {
-            res = poll_future => res,
-            _ = stop_rx.fuse() => Ok(()),
+        tokio::select! {
+            res = &mut poll_future => res,
+            _ = &mut stop_rx => Ok(()),
         }
     };
 
@@ -402,17 +377,14 @@ where
     Ok((GenericAioContext { inner }, handle, background))
 }
 
-impl<
-        M: RawMutex,
-        A: crate::IntrusiveAdapter<M, L>,
-        L: DefaultLinkOps<Ops = A::LinkOps> + Default,
-    > GenericAioContext<M, A, L>
+impl<M: RawMutex, A: crate::IntrusiveAdapter<M, L>, L: DefaultLinkOps<Ops = A::LinkOps> + Default>
+    GenericAioContext<M, A, L>
 where
     A::LinkOps: LinkedListOps + Default,
 {
     /// Number of available AIO slots left in the context
     pub fn available_slots(&self) -> Option<usize> {
-        self.inner.capacity.as_ref().map(|c| c.permits())
+        self.inner.capacity.as_ref().map(|c| c.available_permits())
     }
 
     /// Close the AIO context and wait for all related running futures to complete.

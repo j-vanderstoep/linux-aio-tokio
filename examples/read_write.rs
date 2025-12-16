@@ -2,7 +2,7 @@ use std::fs::OpenOptions;
 
 use tempfile::tempdir;
 
-use linux_aio_tokio::{aio_context, AioOpenOptionsExt, LockedBuf, ReadFlags, WriteFlags};
+use linux_aio_tokio::{AioOpenOptionsExt, LockedBuf, ReadFlags, WriteFlags, aio_context};
 
 #[tokio::main]
 async fn main() {

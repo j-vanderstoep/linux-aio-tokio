@@ -1,6 +1,6 @@
 use crate::flags::{ReadFlags, WriteFlags};
 use crate::locked_buf::LifetimeExtender;
-use crate::{aio, LockedBuf};
+use crate::{LockedBuf, aio};
 
 /// Raw AIO command
 #[derive(Debug)]

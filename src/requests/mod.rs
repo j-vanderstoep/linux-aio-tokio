@@ -4,14 +4,14 @@ use std::marker::PhantomData;
 use std::os::unix::prelude::*;
 use std::{io, mem};
 
-use futures::channel::oneshot;
 use intrusive_collections::linked_list::LinkedListOps;
 use intrusive_collections::{DefaultLinkOps, LinkedList};
 use lock_api::{Mutex, RawMutex};
+use tokio::sync::oneshot;
 
 use crate::locked_buf::LifetimeExtender;
 pub use crate::requests::atomic_link::AtomicLink;
-use crate::{aio, AioResult, RawCommand};
+use crate::{AioResult, RawCommand, aio};
 
 pub use self::intrusive_adapter::{IntrusiveAdapter, LocalRequestAdapter, SyncRequestAdapter};
 
@@ -51,7 +51,7 @@ impl<M: RawMutex, L: DefaultLinkOps + Default> Default for Request<M, L> {
 }
 impl<M: RawMutex, L: DefaultLinkOps + Default> Request<M, L> {
     pub fn aio_addr(&self) -> u64 {
-        (unsafe { mem::transmute::<_, usize>(self as *const Self) }) as u64
+        (self as *const Self as usize) as u64
     }
 
     pub fn send_to_waiter(&self, data: AioResult) -> bool {
@@ -78,7 +78,7 @@ impl<M: RawMutex, L: DefaultLinkOps + Default> Request<M, L> {
         let (addr, buf_len) = command.buffer_addr().unwrap_or((0, 0));
         let len = command.len().unwrap_or(0);
 
-        assert!(len <= buf_len as u64, "len should be <= buffer.size()");
+        assert!(len <= buf_len, "len should be <= buffer.size()");
 
         inner.aio_req.aio_data = request_addr;
         inner.aio_req.aio_resfd = eventfd as u32;

@@ -1,7 +1,9 @@
+#![allow(clippy::arc_with_non_send_sync)]
+
 use std::cell::UnsafeCell;
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
-use std::{fmt, io, mem};
+use std::{fmt, io};
 
 use memmap::MmapMut;
 use thiserror::Error;
@@ -72,7 +74,7 @@ impl LockedBuf {
 
     pub(crate) fn aio_addr_and_len(&self) -> (u64, u64) {
         let len = unsafe { &*self.inner.get() }.bytes.len() as u64;
-        let ptr = unsafe { mem::transmute::<_, usize>((*self.inner.get()).bytes.as_ptr()) } as u64;
+        let ptr = unsafe { (*self.inner.get()).bytes.as_ptr() as usize } as u64;
         (ptr, len)
     }
 

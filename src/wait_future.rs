@@ -1,12 +1,12 @@
 use std::mem;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 
-use futures::channel::oneshot;
-use futures::{ready, Future};
 use intrusive_collections::DefaultLinkOps;
 use lock_api::RawMutex;
+use std::future::Future;
+use tokio::sync::oneshot;
 
 use crate::errors::AioCommandError;
 use crate::requests::Request;
@@ -25,11 +25,8 @@ pub(crate) struct AioWaitFuture<
     request: Option<Box<Request<M, L>>>,
 }
 
-impl<
-        M: RawMutex,
-        A: crate::IntrusiveAdapter<M, L>,
-        L: DefaultLinkOps<Ops = A::LinkOps> + Default,
-    > AioWaitFuture<M, A, L>
+impl<M: RawMutex, A: crate::IntrusiveAdapter<M, L>, L: DefaultLinkOps<Ops = A::LinkOps> + Default>
+    AioWaitFuture<M, A, L>
 where
     A::LinkOps: LinkedListOps + Default,
 {
@@ -42,7 +39,7 @@ where
             .return_in_flight_to_ready(req);
 
         if let Some(c) = &self.inner_context.capacity {
-            c.release(1)
+            c.add_permits(1)
         }
     }
 
@@ -59,11 +56,8 @@ where
     }
 }
 
-impl<
-        M: RawMutex,
-        A: crate::IntrusiveAdapter<M, L>,
-        L: DefaultLinkOps<Ops = A::LinkOps> + Default,
-    > Future for AioWaitFuture<M, A, L>
+impl<M: RawMutex, A: crate::IntrusiveAdapter<M, L>, L: DefaultLinkOps<Ops = A::LinkOps> + Default>
+    Future for AioWaitFuture<M, A, L>
 where
     A::LinkOps: LinkedListOps + Default,
 {
@@ -78,11 +72,8 @@ where
     }
 }
 
-impl<
-        M: RawMutex,
-        A: crate::IntrusiveAdapter<M, L>,
-        L: DefaultLinkOps<Ops = A::LinkOps> + Default,
-    > Drop for AioWaitFuture<M, A, L>
+impl<M: RawMutex, A: crate::IntrusiveAdapter<M, L>, L: DefaultLinkOps<Ops = A::LinkOps> + Default>
+    Drop for AioWaitFuture<M, A, L>
 where
     A::LinkOps: LinkedListOps + Default,
 {

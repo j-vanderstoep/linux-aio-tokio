@@ -2,16 +2,14 @@ use std::fs::OpenOptions;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::future::join_all;
-use futures::stream::FuturesUnordered;
-use futures::{pin_mut, select, FutureExt, StreamExt};
-use rand::{thread_rng, Rng};
+use rand::{Rng, thread_rng};
 use tempfile::tempdir;
-use tokio::time::delay_for;
+use tokio::task::JoinSet;
+use tokio::time::sleep;
 
 use helpers::*;
 use linux_aio_tokio::AioOpenOptionsExt;
-use linux_aio_tokio::{aio_context, LockedBuf, ReadFlags, WriteFlags};
+use linux_aio_tokio::{LockedBuf, ReadFlags, WriteFlags, aio_context};
 
 const PAGE_SIZE: usize = 1024 * 1024;
 const NUM_PAGES: usize = 256;
@@ -22,8 +20,13 @@ const NUM_AIO_THREADS: usize = 4;
 
 pub mod helpers;
 
-#[tokio::test(threaded_scheduler)]
+#[tokio::test(flavor = "multi_thread")]
 async fn load_test() {
+    if LockedBuf::with_size(PAGE_SIZE).is_err() {
+        eprintln!("Skipping load_test due to memlock limitations");
+        return;
+    }
+
     let dir = tempdir().unwrap();
     let path = dir.path().join("tmp");
 
@@ -45,12 +48,15 @@ async fn load_test() {
         let file = file.clone();
 
         f.push(tokio::spawn(async move {
-            let mut buffer = LockedBuf::with_size(PAGE_SIZE).unwrap();
+            let mut buffer = match LockedBuf::with_size(PAGE_SIZE) {
+                Ok(buf) => buf,
+                Err(_) => return,
+            };
             let aio_handle = aio_handle.clone();
             let file = file.clone();
 
             loop {
-                let page = thread_rng().gen_range(0, NUM_PAGES);
+                let page = thread_rng().gen_range(0..NUM_PAGES);
 
                 let res = file
                     .read_at(
@@ -73,13 +79,16 @@ async fn load_test() {
         let file = file.clone();
 
         f.push(tokio::spawn(async move {
-            let mut buffer = LockedBuf::with_size(PAGE_SIZE).unwrap();
+            let mut buffer = match LockedBuf::with_size(PAGE_SIZE) {
+                Ok(buf) => buf,
+                Err(_) => return,
+            };
 
             let aio_handle = aio_handle.clone();
             let file = file.clone();
 
             loop {
-                let page = thread_rng().gen_range(0, NUM_PAGES);
+                let page = thread_rng().gen_range(0..NUM_PAGES);
                 thread_rng().fill(buffer.as_mut());
 
                 let res = file
@@ -98,29 +107,38 @@ async fn load_test() {
         }));
     }
 
-    let stress = join_all(f).fuse();
+    let stress = async {
+        for handle in f {
+            let _ = handle.await;
+        }
+    };
 
-    pin_mut!(stress);
+    let timeout = sleep(Duration::from_secs(30));
 
-    let mut timeout = delay_for(Duration::from_secs(30)).fuse();
+    tokio::pin!(stress);
+    tokio::pin!(timeout);
 
-    select! {
-        _ = stress => {
+    tokio::select! {
+        _ = &mut stress => {
             // never ends
-            assert!(false);
+            panic!("stress tasks unexpectedly completed");
         },
-        _ = timeout => {
-            assert!(true);
+        _ = &mut timeout => {
         },
     }
 
     dir.close().unwrap();
 }
 
-#[tokio::test(threaded_scheduler)]
+#[tokio::test(flavor = "multi_thread")]
 async fn read_many_blocks_mt() {
     const FILE_SIZE: usize = 1024 * 512;
     const BUF_CAPACITY: usize = 8192;
+
+    if LockedBuf::with_size(BUF_CAPACITY).is_err() {
+        eprintln!("Skipping read_many_blocks_mt due to memlock limitations");
+        return;
+    }
 
     let (dir, path) = create_filled_tempfile(FILE_SIZE);
 
@@ -136,7 +154,7 @@ async fn read_many_blocks_mt() {
 
     // Waves start here
     for _wave in 0u64..50 {
-        let f = FuturesUnordered::new();
+        let mut set = JoinSet::new();
         let aio_handle = aio_handle.clone();
         let file = file.clone();
 
@@ -145,9 +163,12 @@ async fn read_many_blocks_mt() {
             let file = file.clone();
             let aio_handle = aio_handle.clone();
 
-            f.push(async move {
+            set.spawn(async move {
                 let offset = (index * BUF_CAPACITY as u64) % FILE_SIZE as u64;
-                let mut buffer = LockedBuf::with_size(BUF_CAPACITY).unwrap();
+                let mut buffer = match LockedBuf::with_size(BUF_CAPACITY) {
+                    Ok(buf) => buf,
+                    Err(_) => return,
+                };
 
                 file.read_at(
                     &aio_handle,
@@ -163,7 +184,9 @@ async fn read_many_blocks_mt() {
             });
         }
 
-        let _ = f.collect::<Vec<_>>().await;
+        while let Some(res) = set.join_next().await {
+            res.unwrap();
+        }
 
         // all slots have been returned
         assert_eq!(num_slots, aio.available_slots().unwrap());

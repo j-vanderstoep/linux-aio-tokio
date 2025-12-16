@@ -3,6 +3,7 @@ use bitflags::bitflags;
 use crate::aio;
 
 bitflags! {
+    #[derive(Debug)]
     /// AIO write flags. See [`io_submit`](http://man7.org/linux/man-pages/man2/io_submit.2.html)
     pub struct WriteFlags: isize {
         /// Append data to the end of the file.  See the description
@@ -46,6 +47,7 @@ bitflags! {
 }
 
 bitflags! {
+    #[derive(Debug)]
     /// AIO read flags. See [`io_submit`](http://man7.org/linux/man-pages/man2/io_submit.2.html)
     pub struct ReadFlags: isize {
         /// High priority request, poll if possible

@@ -1,16 +1,17 @@
+#![allow(clippy::enum_variant_names)]
+
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::pin::Pin;
-use std::task::Poll;
+use std::task::{Context, Poll};
 use std::{fmt, mem, slice};
 
-use futures::task::Context;
-use futures::{self, ready, Sink, Stream};
 use libc::eventfd;
-use mio::{self, Ready};
 use thiserror::Error;
-use tokio::io::PollEvented;
+use tokio::io::Ready;
+use tokio::io::unix::AsyncFd;
+use tokio_stream::Stream;
 
 #[derive(Error, Debug)]
 pub enum EventFdError {
@@ -26,41 +27,61 @@ pub struct EventFdInner {
     pub inner: File,
 }
 
-impl mio::Evented for EventFdInner {
-    fn register(
-        &self,
-        poll: &mio::Poll,
-        token: mio::Token,
-        interest: mio::Ready,
-        opts: mio::PollOpt,
-    ) -> io::Result<()> {
-        mio::unix::EventedFd(&self.inner.as_raw_fd()).register(poll, token, interest, opts)
-    }
-
-    fn reregister(
-        &self,
-        poll: &mio::Poll,
-        token: mio::Token,
-        interest: mio::Ready,
-        opts: mio::PollOpt,
-    ) -> io::Result<()> {
-        mio::unix::EventedFd(&self.inner.as_raw_fd()).reregister(poll, token, interest, opts)
-    }
-
-    fn deregister(&self, poll: &mio::Poll) -> io::Result<()> {
-        mio::unix::EventedFd(&self.inner.as_raw_fd()).deregister(poll)
+impl AsRawFd for EventFdInner {
+    fn as_raw_fd(&self) -> RawFd {
+        self.inner.as_raw_fd()
     }
 }
 
 /// Tokio-aware EventFd implementation
 pub struct EventFd {
-    evented: PollEvented<EventFdInner>,
-    accepted: Option<u64>,
+    evented: AsyncFd<EventFdInner>,
 }
 
 impl fmt::Debug for EventFd {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("EventFd").finish()
+    }
+}
+
+impl Stream for EventFd {
+    type Item = Result<u64, EventFdError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+
+        loop {
+            let mut guard = match this.evented.poll_read_ready_mut(cx) {
+                Poll::Ready(Ok(g)) => g,
+                Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(EventFdError::PollError(e)))),
+                Poll::Pending => return Poll::Pending,
+            };
+
+            let mut result = 0u64;
+            let result_ptr = &mut result as *mut u64 as *mut u8;
+
+            match guard
+                .get_inner_mut()
+                .inner
+                .read(unsafe { slice::from_raw_parts_mut(result_ptr, 8) })
+            {
+                Ok(rc) => {
+                    if rc != mem::size_of::<u64>() {
+                        panic!(
+                            "Reading from an eventfd should transfer exactly {} bytes",
+                            mem::size_of::<u64>()
+                        )
+                    }
+
+                    assert_ne!(result, 0);
+                    return Poll::Ready(Some(Ok(result)));
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    guard.clear_ready_matching(Ready::READABLE);
+                }
+                Err(e) => return Poll::Ready(Some(Err(EventFdError::ReadError(e)))),
+            }
+        }
     }
 }
 
@@ -74,9 +95,9 @@ impl EventFd {
     /// Create EventFd  with `init` permits.
     pub fn new(init: usize, semaphore: bool) -> Result<EventFd, EventFdError> {
         let flags = if semaphore {
-            libc::O_CLOEXEC | libc::EFD_NONBLOCK as i32 | libc::EFD_SEMAPHORE as i32
+            libc::O_CLOEXEC | libc::EFD_NONBLOCK | libc::EFD_SEMAPHORE
         } else {
-            libc::O_CLOEXEC | libc::EFD_NONBLOCK as i32
+            libc::O_CLOEXEC | libc::EFD_NONBLOCK
         };
 
         let fd = unsafe { eventfd(init as libc::c_uint, flags) };
@@ -86,109 +107,76 @@ impl EventFd {
         }
 
         Ok(EventFd {
-            evented: PollEvented::new(EventFdInner {
+            evented: AsyncFd::new(EventFdInner {
                 inner: unsafe { File::from_raw_fd(fd) },
             })
             .map_err(EventFdError::PollError)?,
-            accepted: None,
         })
     }
-}
 
-impl Stream for EventFd {
-    type Item = Result<u64, EventFdError>;
+    /// Receive the next value from the eventfd, waiting for readability.
+    pub async fn recv(&mut self) -> Result<u64, EventFdError> {
+        loop {
+            let mut guard = self
+                .evented
+                .readable_mut()
+                .await
+                .map_err(EventFdError::PollError)?;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let ready = Ready::readable();
+            let mut result = 0u64;
+            let result_ptr = &mut result as *mut u64 as *mut u8;
 
-        ready!(self.evented.poll_read_ready(cx, ready)).map_err(EventFdError::PollError)?;
-
-        let mut result = 0u64;
-        let result_ptr = &mut result as *mut u64 as *mut u8;
-
-        match self
-            .evented
-            .get_mut()
-            .inner
-            .read(unsafe { slice::from_raw_parts_mut(result_ptr, 8) })
-        {
-            Ok(rc) => {
-                if rc as usize != mem::size_of::<u64>() {
-                    panic!(
-                        "Reading from an eventfd should transfer exactly {} bytes",
-                        mem::size_of::<u64>()
-                    )
-                }
-
-                assert_ne!(result, 0);
-                Poll::Ready(Some(Ok(result)))
-            }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                self.evented
-                    .clear_read_ready(cx, ready)
-                    .map_err(EventFdError::PollError)?;
-
-                Poll::Pending
-            }
-            Err(e) => Poll::Ready(Some(Err(EventFdError::ReadError(e)))),
-        }
-    }
-}
-
-impl Sink<u64> for EventFd {
-    type Error = EventFdError;
-
-    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        if self.accepted.is_none() {
-            Poll::Ready(Ok(()))
-        } else {
-            Poll::Pending
-        }
-    }
-
-    fn start_send(mut self: Pin<&mut Self>, item: u64) -> Result<(), Self::Error> {
-        assert!(self.accepted.is_none());
-        self.accepted = Some(item);
-
-        Ok(())
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        ready!(self.evented.poll_write_ready(cx)).map_err(EventFdError::PollError)?;
-
-        {
-            let bytes: &mut [u8; 8] =
-                unsafe { &mut *(self.accepted.as_mut().unwrap() as *mut u64 as *mut [u8; 8]) };
-
-            match self.evented.get_mut().inner.write(bytes) {
+            match guard
+                .get_inner_mut()
+                .inner
+                .read(unsafe { slice::from_raw_parts_mut(result_ptr, 8) })
+            {
                 Ok(rc) => {
-                    assert_eq!(8, rc);
+                    if rc != mem::size_of::<u64>() {
+                        panic!(
+                            "Reading from an eventfd should transfer exactly {} bytes",
+                            mem::size_of::<u64>()
+                        )
+                    }
+
+                    assert_ne!(result, 0);
+                    return Ok(result);
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    self.evented
-                        .clear_write_ready(cx)
-                        .map_err(EventFdError::PollError)?;
-
-                    return Poll::Pending;
+                    guard.clear_ready_matching(Ready::READABLE);
                 }
-                Err(e) => return Poll::Ready(Err(EventFdError::ReadError(e))),
+                Err(e) => return Err(EventFdError::ReadError(e)),
             }
         }
-
-        self.accepted = None;
-
-        Poll::Ready(Ok(()))
     }
 
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.poll_flush(cx)
+    /// Send a value into the eventfd, waiting for writability.
+    pub async fn send_value(&mut self, value: u64) -> Result<(), EventFdError> {
+        let bytes = value.to_ne_bytes();
+
+        loop {
+            let mut guard = self
+                .evented
+                .writable_mut()
+                .await
+                .map_err(EventFdError::PollError)?;
+
+            match guard.get_inner_mut().inner.write(&bytes) {
+                Ok(rc) => {
+                    assert_eq!(8, rc);
+                    return Ok(());
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    guard.clear_ready_matching(Ready::WRITABLE);
+                }
+                Err(e) => return Err(EventFdError::ReadError(e)),
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use futures::{SinkExt, StreamExt};
-
     use super::*;
 
     #[tokio::test]
@@ -198,14 +186,14 @@ mod tests {
 
         let mut efd = EventFd::new(init, false).unwrap();
 
-        assert_eq!(init as u64, efd.next().await.unwrap().unwrap());
+        assert_eq!(init as u64, efd.recv().await.unwrap());
 
-        efd.send(increment).await.unwrap();
-        assert_eq!(increment, efd.next().await.unwrap().unwrap());
+        efd.send_value(increment).await.unwrap();
+        assert_eq!(increment, efd.recv().await.unwrap());
 
-        efd.send(increment).await.unwrap();
-        efd.send(increment).await.unwrap();
-        assert_eq!(2 * increment, efd.next().await.unwrap().unwrap());
+        efd.send_value(increment).await.unwrap();
+        efd.send_value(increment).await.unwrap();
+        assert_eq!(2 * increment, efd.recv().await.unwrap());
     }
 
     #[tokio::test]
@@ -215,14 +203,14 @@ mod tests {
 
         let mut efd = EventFd::new(init, true).unwrap();
 
-        efd.send(increment).await.unwrap();
+        efd.send_value(increment).await.unwrap();
         for _ in 0..(increment as usize + init) {
-            assert_eq!(1, efd.next().await.unwrap().unwrap());
+            assert_eq!(1, efd.recv().await.unwrap());
         }
 
-        efd.send(increment).await.unwrap();
+        efd.send_value(increment).await.unwrap();
         for _ in 0..(increment as usize) {
-            assert_eq!(1, efd.next().await.unwrap().unwrap());
+            assert_eq!(1, efd.recv().await.unwrap());
         }
     }
 }

@@ -1,7 +1,7 @@
 #![allow(missing_docs)]
 
 use intrusive_collections::{
-    intrusive_adapter, linked_list, Adapter, DefaultLinkOps, DefaultPointerOps,
+    Adapter, DefaultLinkOps, DefaultPointerOps, intrusive_adapter, linked_list,
 };
 use lock_api::RawMutex;
 
